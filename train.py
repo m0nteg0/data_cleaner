@@ -1,148 +1,84 @@
-from typing import Optional, List, Union
+from typing import Iterable, Optional
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.datasets as datasets
-import segmentation_models_pytorch as smp
-from segmentation_models_pytorch.encoders import get_encoder
-from segmentation_models_pytorch.decoders.unet.decoder import \
-    UnetDecoder, CenterBlock, DecoderBlock
-from segmentation_models_pytorch.base import (
-    SegmentationHead
-)
 from albumentations.pytorch import ToTensorV2
+from tqdm import tqdm
+
+from data_cleaner.models.vae import AutoEncoder
 
 
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        encoder_channels,
-        decoder_channels,
-        n_blocks=5,
-        use_batchnorm=True,
-        attention_type=None,
-        center=False,
-        z_dim: int = 10
-    ):
-        super().__init__()
-
-        if n_blocks != len(decoder_channels):
-            raise ValueError(
-                "Model depth is {}, but you provide `decoder_channels` for {} blocks.".format(
-                    n_blocks, len(decoder_channels)
-                )
-            )
-
-        # remove first skip with same spatial resolution
-        encoder_channels = encoder_channels[1:]
-        # reverse channels to start from head of encoder
-        encoder_channels = encoder_channels[::-1]
-
-        # computing blocks input and output channels
-        head_channels = encoder_channels[0]
-        in_channels = [head_channels] + list(decoder_channels[:-1])
-        out_channels = decoder_channels
-
-        if center:
-            self.center = CenterBlock(head_channels, head_channels, use_batchnorm=use_batchnorm)
-        else:
-            self.center = nn.Identity()
-
-        # combine decoder keyword arguments
-        kwargs = dict(use_batchnorm=use_batchnorm, attention_type=attention_type)
-        blocks = [
-            DecoderBlock(in_ch, 0, out_ch, **kwargs)
-            for in_ch, out_ch in zip(in_channels, out_channels)
-        ]
-        self.blocks = nn.ModuleList(blocks)
-        self.linear = nn.Linear(z_dim, 512)
-
-    def forward(self, z, encoder_output_size: int = 7):
-        x = self.linear(z)
-        x = x.view(z.size(0), 512, 1, 1)
-        x = F.interpolate(x, size=encoder_output_size)
-        for i, decoder_block in enumerate(self.blocks):
-            x = decoder_block(x, None)
-        return x
-
-
-class AutoEncoder(nn.Module):
+class Trainer:
     def __init__(
             self,
-            encoder_name: str = "resnet34",
-            encoder_depth: int = 5,
-            encoder_weights: Optional[str] = "imagenet",
-            decoder_use_batchnorm: bool = True,
-            decoder_channels: List[int] = (256, 128, 64, 32, 16),
-            decoder_attention_type: Optional[str] = None,
-            in_channels: int = 3,
-            z_dim: int = 10,
-            activation: Optional[Union[str, callable]] = None
+            model: nn.Module,
+            train_dataset: Iterable,
+            val_dataset: Optional[Iterable] = None,
+            **kwargs
     ):
-        super().__init__()
+        self.model = model
+        self.train_ds = train_dataset
+        self.val_ds = val_dataset
+        self.lr = kwargs.get('lr', 0.001)
+        self.epochs = kwargs.get('epochs', 0.001)
+        self.device = kwargs.get('device', torch.device('cuda'))
+        self.criterion = nn.MSELoss()
+        self.optimizer = self.init_optimizer(**kwargs)
 
-        self.encoder = get_encoder(
-            encoder_name,
-            in_channels=in_channels,
-            depth=encoder_depth,
-            weights=encoder_weights,
-        )
+    def init_optimizer(self, **kwargs):
+        optimizer = kwargs.get('optimizer', 'RAdam')
+        optimizer = getattr(torch.optim, optimizer)
+        optimizer = optimizer(self.model.parameters(), **{'lr': self.lr})
+        return optimizer
 
-        self.decoder = Decoder(
-            encoder_channels=self.encoder.out_channels,
-            decoder_channels=decoder_channels,
-            n_blocks=encoder_depth,
-            use_batchnorm=decoder_use_batchnorm,
-            center=True if encoder_name.startswith("vgg") else False,
-            attention_type=decoder_attention_type,
-            z_dim=z_dim
-        )
-
-        self.segmentation_head = SegmentationHead(
-            in_channels=decoder_channels[-1],
-            out_channels=in_channels,
-            activation=activation,
-            kernel_size=3,
-        )
-
-        self.linear = nn.Linear(512, 2 * z_dim)
-        self.z_dim = z_dim
-
-    def check_input_shape(self, x):
-        h, w = x.shape[-2:]
-        output_stride = self.encoder.output_stride
-        if h % output_stride != 0 or w % output_stride != 0:
-            new_h = (h // output_stride + 1) * output_stride if h % output_stride != 0 else h
-            new_w = (w // output_stride + 1) * output_stride if w % output_stride != 0 else w
-            raise RuntimeError(
-                f"Wrong input shape height={h}, width={w}. Expected image height and width "
-                f"divisible by {output_stride}. Consider pad your images to shape ({new_h}, {new_w})."
+    def train_loop(self, epoch: int = 0):
+        self.model.train()
+        avg_loss = 0
+        pbar = tqdm(self.train_ds)
+        for batch, x in enumerate(pbar):
+            self.optimizer.zero_grad()
+            x = x[0] if isinstance(x, tuple) else x
+            x = x.to(self.device)
+            output = self.model(x)
+            loss = self.criterion(output, x)
+            loss.backward()
+            self.optimizer.step()
+            avg_loss += loss.item()
+            pbar.set_description(
+                f'[{epoch}/{self.epochs}][{0}/{len(self.train_ds)}]'
+                f'Loss = {loss.item()}, Avg Loss = {avg_loss / (batch + 1)}'
             )
+        return avg_loss / len(self.train_ds)
 
-    def reparameterize(self, x):
-        x = F.adaptive_avg_pool2d(x, 1)
-        x = x.view(x.size(0), -1)
-        x = self.linear(x)
-        mean = x[:, :self.z_dim]
-        logvar = x[:, self.z_dim:]
-        std = torch.exp(logvar / 2)  # in log-space, squareroot is divide by two
-        epsilon = torch.randn_like(std)
-        return epsilon * std + mean
+    def val_loop(self, epoch: int = 0):
+        self.model.eval()
+        avg_loss = 0
+        pbar = tqdm(self.val_ds)
+        for batch, x in enumerate(pbar):
+            x = x[0] if isinstance(x, tuple) else x
+            x = x.to(self.device)
+            output = self.model(x)
+            loss = self.criterion(output, x).item()
+            avg_loss += loss
+            pbar.set_description(
+                f'[{epoch}/{self.epochs}][{0}/{len(self.val_ds)}]'
+                f'Loss = {loss}, Avg Loss = {avg_loss / (batch + 1)}'
+            )
+        return avg_loss / len(self.val_ds)
 
-    def forward(self, x):
-        """Sequentially pass `x` trough model`s encoder, decoder and heads"""
-
-        self.check_input_shape(x)
-
-        encoder_output = self.encoder(x)[-1]
-        z = self.reparameterize(encoder_output)
-        decoder_output = self.decoder(z, encoder_output.shape[-1])
-        result = self.segmentation_head(decoder_output)
-
-        return result
+    def run(self):
+        avg_val_loss = -1
+        for epoch in range(self.epochs):
+            avg_train_loss = self.train_loop(epoch)
+            if self.val_ds is not None:
+                avg_val_loss = self.val_loop(epoch)
+            print(
+                f'Train epoch loss = {avg_train_loss:.2f}, '
+                f'Val epoch loss = {avg_val_loss:.2f}'
+            )
 
 
 def main():
@@ -153,12 +89,9 @@ def main():
         encoder_name='resnet18', in_channels=1, activation=nn.Sigmoid, z_dim=2
     )
     model.cuda()
-    # model = smp.Unet(
-    #     encoder_name="resnet34",  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7
-    #     encoder_weights="imagenet",  # use `imagenet` pre-trained weights for encoder initialization
-    #     in_channels=1,  # model input channels (1 for gray-scale images, 3 for RGB, etc.)
-    #     classes=1,  # model output channels (number of classes in your dataset)
-    # )
+
+    trainer = Trainer(model, train_dataset=train_ds)
+    a = 0
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.RAdam(model.parameters(), 0.001)
